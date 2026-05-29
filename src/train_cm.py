@@ -34,12 +34,12 @@ def build_neighbor_dict(g):
 def graph_embedding_from_nodes(node_embeddings):
     return node_embeddings.mean(dim=0)
 
-def train_shared_model(graphs, lr, epoch_num, device, encoder, lambda_loss1, lambda_loss2, hidden_dim, sample_size):
-    first_g = graphs[0].to(device)
-    first_feats = first_g.ndata["attr"]
-    first_neighbor_dict = build_neighbor_dict(first_g)
-    neighbor_num_list = [len(v) for v in first_neighbor_dict.values()]
-    in_dim = first_feats.shape[1]
+def train_shared_model(graphs, lr, epoch_num, device, encoder, lambda_loss1, lambda_loss2, hidden_dim, sample_size, batch_size=32):
+    individual_neighbor_dicts = [build_neighbor_dict(g) for g in graphs]
+    
+    first_g = graphs[0]
+    in_dim = first_g.ndata["attr"].shape[1]
+    neighbor_num_list = [len(v) for v in individual_neighbor_dicts[0].values()]
 
     model = GNNStructEncoder(
         in_dim=in_dim,
@@ -61,36 +61,79 @@ def train_shared_model(graphs, lr, epoch_num, device, encoder, lambda_loss1, lam
         weight_decay=3e-4,
     )
 
+    # Prepare batches
+    num_graphs = len(graphs)
     history = []
+    
     for epoch in tqdm(range(epoch_num), desc="epochs"):
         model.train()
         total_loss = 0.0
-
-        for g in tqdm(graphs, desc=f"epoch {epoch:03d}", leave=False):
-            g = g.to(device)
-            feats = g.ndata["attr"].to(device)
-            neighbor_dict = build_neighbor_dict(g)
-            loss, _ = model(g, feats, g.in_degrees(), neighbor_dict, device=device)
+        
+        # Shuffle indices
+        indices = list(range(num_graphs))
+        random.shuffle(indices)
+        
+        pbar = tqdm(range(0, num_graphs, batch_size), desc=f"epoch {epoch:03d}", leave=False)
+        for i in pbar:
+            batch_idx = indices[i : i + batch_size]
+            batch_graphs = [graphs[j] for j in batch_idx]
+            
+            # Batch graphs with DGL
+            bg = dgl.batch(batch_graphs).to(device)
+            feats = bg.ndata["attr"].to(device)
+            degrees = bg.in_degrees().to(device)
+            
+            # Construct a merged neighbor_dict for the batch
+            # dgl.batch shifts node IDs. We need to mirror that.
+            merged_neighbor_dict = {}
+            node_offset = 0
+            for j in batch_idx:
+                g_neighbor_dict = individual_neighbor_dicts[j]
+                num_nodes = graphs[j].num_nodes()
+                for u, neighbors in g_neighbor_dict.items():
+                    merged_neighbor_dict[u + node_offset] = [v + node_offset for v in neighbors]
+                node_offset += num_nodes
+                
+            loss, _ = model(bg, feats, degrees, merged_neighbor_dict, device=device)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item()
+            total_loss += loss.item() * len(batch_idx)
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
-        avg_loss = total_loss / len(graphs)
+        avg_loss = total_loss / num_graphs
         history.append(avg_loss)
         print(f"epoch {epoch:03d} loss={avg_loss:.6f}")
 
     model.eval()
     graph_embeddings = []
     with torch.no_grad():
-        for g in graphs:
-            g = g.to(device)
-            feats = g.ndata["attr"].to(device)
-            neighbor_dict = build_neighbor_dict(g)
-            _, node_embeddings = model(g, feats, g.in_degrees(), neighbor_dict, device=device)
-            graph_embeddings.append(graph_embedding_from_nodes(node_embeddings).cpu())
+        for i in range(0, num_graphs, batch_size):
+            batch_graphs = graphs[i : i + batch_size]
+            bg = dgl.batch(batch_graphs).to(device)
+            feats = bg.ndata["attr"].to(device)
+            degrees = bg.in_degrees().to(device)
+            
+            merged_neighbor_dict = {}
+            node_offset = 0
+            for j in range(i, min(i + batch_size, num_graphs)):
+                g_neighbor_dict = individual_neighbor_dicts[j]
+                num_nodes = graphs[j].num_nodes()
+                for u, neighbors in g_neighbor_dict.items():
+                    merged_neighbor_dict[u + node_offset] = [v + node_offset for v in neighbors]
+                node_offset += num_nodes
+
+            _, node_embeddings = model(bg, feats, degrees, merged_neighbor_dict, device=device)
+            
+            # Split node embeddings back to individual graphs and pool
+            node_offset = 0
+            for g_in_batch in batch_graphs:
+                num_nodes = g_in_batch.num_nodes()
+                g_node_embeddings = node_embeddings[node_offset : node_offset + num_nodes]
+                graph_embeddings.append(graph_embedding_from_nodes(g_node_embeddings).cpu())
+                node_offset += num_nodes
 
     return model, torch.stack(graph_embeddings, dim=0), history
 
@@ -105,7 +148,8 @@ def main():
     parser.add_argument("--dimension", type=int, default=128)
     parser.add_argument("--encoder", type=str, default="GCN", choices=["GCN", "GIN", "SAGE"])
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--batch_size", type=int, default=32)
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -132,6 +176,7 @@ def main():
         lambda_loss2=args.lambda_loss2,
         hidden_dim=args.dimension,
         sample_size=args.sample_size,
+        batch_size=args.batch_size,
     )
 
     torch.save(model.state_dict(), "output/shared_model.pt")

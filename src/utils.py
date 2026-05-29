@@ -182,10 +182,13 @@ def hungarian_loss(predictions, targets, mask, pool):
     squared_error = torch.sqrt((predictions - targets).pow(2).mean(1))
     squared_error_np = squared_error.detach().cpu().numpy()
     indices = pool.map(per_sample_hungarian_loss, squared_error_np)
-    # print(indices)
+    
     losses = [sample[row_idx, col_idx].mean() for sample, (row_idx, col_idx) in zip(squared_error, indices)]
     total_loss = torch.mean(torch.stack(list(losses)))
-    return total_loss, indices[0][1]
+    
+    # Return all column indices for the batch
+    all_col_idx = [col_idx for (row_idx, col_idx) in indices]
+    return total_loss, all_col_idx
 
 
 class NodeClassificationDataset(Dataset):

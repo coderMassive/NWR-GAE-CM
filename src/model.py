@@ -124,9 +124,9 @@ class GNNStructEncoder(nn.Module):
     # Sample neighbors from neighbor set, if the length of neighbor set less than sample size, then do the padding.
     def sample_neighbors(self, indexes, neighbor_dict, gt_embeddings):
         sampled_embeddings_list = []
+        sampled_ids_list = []
         mark_len_list = []
         for index in indexes:
-            sampled_embeddings = []
             neighbor_indexes = neighbor_dict[index]
             if len(neighbor_indexes) < self.sample_size:
                 mask_len = len(neighbor_indexes)
@@ -134,14 +134,23 @@ class GNNStructEncoder(nn.Module):
             else:
                 sample_indexes = random.sample(neighbor_indexes, self.sample_size)
                 mask_len = self.sample_size
-            for index in sample_indexes:
-                sampled_embeddings.append(gt_embeddings[index].tolist())
+            
+            current_sample_ids = list(sample_indexes)
+            sampled_embeddings = []
+            for idx in sample_indexes:
+                sampled_embeddings.append(gt_embeddings[idx])
+            
             if len(sampled_embeddings) < self.sample_size:
-                for _ in range(self.sample_size - len(sampled_embeddings)):
-                    sampled_embeddings.append(torch.zeros(self.out_dim).tolist())
-            sampled_embeddings_list.append(sampled_embeddings)
+                pad_len = self.sample_size - len(sampled_embeddings)
+                for _ in range(pad_len):
+                    sampled_embeddings.append(torch.zeros(self.out_dim).to(gt_embeddings.device))
+                    current_sample_ids.append(-1)
+            
+            sampled_embeddings_list.append(torch.stack(sampled_embeddings))
+            sampled_ids_list.append(current_sample_ids)
             mark_len_list.append(mask_len)
-        return sampled_embeddings_list, mark_len_list
+            
+        return torch.stack(sampled_embeddings_list), sampled_ids_list, mark_len_list
 
     def reconstruction_neighbors(self, FNN_generator, neighbor_indexes, neighbor_dict, from_layer, to_layer, device):
         '''
@@ -159,30 +168,45 @@ class GNNStructEncoder(nn.Module):
          loss   :   reconstruction loss
          new index    :   new indexes after hungarian matching
         '''
-        local_index_loss = 0
-        sampled_embeddings_list, mark_len_list = self.sample_neighbors(neighbor_indexes, neighbor_dict, to_layer)
-        for i, neighbor_embeddings1 in enumerate(sampled_embeddings_list):
-            # Generating h^k_v, reparameterization trick
-            index = neighbor_indexes[i]
-            mask_len1 = mark_len_list[i]
-            mean = from_layer[index].repeat(self.sample_size, 1)
-            mean = self.mlp_mean(mean)
-            sigma = from_layer[index].repeat(self.sample_size, 1)
-            sigma = self.mlp_sigma(sigma)
-            std_z = self.m.sample().to(device)
-            var = mean + sigma.exp() * std_z
-            nhij = FNN_generator(var, device)
-            generated_neighbors = nhij
-            # Caculate 2-Wasserstein distance
-            sum_neighbor_norm = 0
-            # For appendix D approximate experiment
-            for indexi, generated_neighbor in enumerate(generated_neighbors):
-                sum_neighbor_norm += torch.norm(generated_neighbor) / math.sqrt(self.out_dim)
-            generated_neighbors = torch.unsqueeze(generated_neighbors, dim=0).to(device)
-            target_neighbors = torch.unsqueeze(torch.FloatTensor(neighbor_embeddings1), dim=0).to(device)
-            hun_loss, new_index = hungarian_loss(generated_neighbors, target_neighbors, mask_len1, self.pool)
-            local_index_loss += hun_loss
-        return local_index_loss, new_index
+        sampled_embeddings, sampled_ids, mark_len_list = self.sample_neighbors(neighbor_indexes, neighbor_dict, to_layer)
+        
+        N = len(neighbor_indexes)
+        S = self.sample_size
+        
+        # Vectorize generation
+        h_repeated = from_layer[neighbor_indexes].repeat_interleave(S, dim=0)
+        
+        mean = self.mlp_mean(h_repeated)
+        sigma = self.mlp_sigma(h_repeated)
+        
+        # Sample for the whole batch
+        std_z = self.m.sample((N,)).to(device).view(N * S, -1)
+        var = mean + sigma.exp() * std_z
+        
+        nhij = FNN_generator(var, device)
+        generated_neighbors = nhij.view(N, S, -1)
+        
+        target_neighbors = sampled_embeddings.to(device)
+        
+        # Call vectorized hungarian_loss
+        hun_loss, all_col_idx = hungarian_loss(generated_neighbors, target_neighbors, S, self.pool)
+        
+        # Reorder sampled_ids based on all_col_idx
+        new_indexes = []
+        for i in range(N):
+            col_idx = all_col_idx[i]
+            for j in col_idx:
+                neighbor_id = sampled_ids[i][j]
+                if neighbor_id != -1:
+                    new_indexes.append(neighbor_id)
+        
+        # Use unique IDs to avoid redundant work in the next layer
+        if new_indexes:
+            new_indexes = list(set(new_indexes))
+        else:
+            new_indexes = neighbor_indexes
+            
+        return hun_loss, new_indexes
 
     def neighbor_decoder(self, gij, ground_truth_degree_matrix, g, h0, neighbor_dict, device, l3, l2, l1, h):
         '''
