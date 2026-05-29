@@ -1,5 +1,4 @@
 import sys
-sys.path.append("..")
 from data import build_graph, utils
 import seaborn as sb
 import torch

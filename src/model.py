@@ -1,5 +1,5 @@
-from src.layers import MLP, MLP_generator, PairNorm, FNN
-from src.utils import hungarian_loss
+from layers import MLP, MLP_generator, PairNorm, FNN
+from utils import hungarian_loss
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
